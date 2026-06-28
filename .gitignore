@@ -1,0 +1,16 @@
+# virtual environments
+.venv/
+venv/
+
+# simulation output
+out_*/
+*.nc
+
+# generated plots (the tracked example lives in docs/)
+/height.png
+*.png
+!docs/*.png
+
+# python
+__pycache__/
+*.pyc

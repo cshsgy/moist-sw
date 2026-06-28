@@ -1,0 +1,65 @@
+geometry:
+  type: gnomonic-equiangle      # gnomonic-equiangle cubed sphere
+  bounds:
+    x1min: 6371000.0            # planet radius (m); thin shell -> x1max - x1min
+    x1max: 6371001.0
+    x2min_pi: -0.25             # each cube face spans [-pi/4, pi/4] in (xi, eta)
+    x2max_pi: 0.25
+    x3min_pi: -0.25
+    x3max_pi: 0.25
+  cells:
+    nx1: 1                      # single radial layer -> shallow water
+    nx2: 96                     # cells per face in xi
+    nx3: 96                     # cells per face in eta
+    nghost: 3
+distribute:
+  backend: gloo                 # CPU collective backend (use nccl for multi-GPU)
+  layout: cubed-sphere
+  nb2: 1
+  nb3: 1
+  blocks_per_process: 6         # all six cube faces on one process
+  verbose: false
+dynamics:
+  equation-of-state:
+    type: shallow-water
+  reconstruct:
+    vertical:
+      type: weno5
+      scale: false
+      shock: false
+    horizontal:
+      type: weno5
+      scale: false
+      shock: false
+  riemann-solver:
+    type: shallow-roe
+    dir: yz
+boundary-condition:
+  external:
+    x1-inner: reflecting
+    x1-outer: reflecting
+    x2-inner: custom            # cubed-sphere panel-to-panel exchange
+    x2-outer: custom
+    x3-inner: custom
+    x3-outer: custom
+integration:
+  type: rk3
+  cfl: 0.7
+  nlim: -1                      # -1 = run until tlim; override on CLI with --nlim
+  tlim: 1296000.0              # 15 days (s)
+  ncycle_out: 200
+outputs:
+- type: netcdf
+  variables:
+  - prim
+  dt: 21600.0                  # write every 6 h
+forcing:
+  coriolis:
+    type: xyz
+    omega1: 7.292e-05          # Earth rotation rate (rad/s)
+problem:
+  note: >
+    Global shallow water on the cubed sphere, initialized from a resting,
+    flat free surface plus band-limited random noise in the geopotential.
+    Geostrophic adjustment then spins up freely evolving shallow-water
+    turbulence. Initial condition is set in swe_noise.py.

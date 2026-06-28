@@ -1,0 +1,5 @@
+snapy>=2.8
+matplotlib
+netCDF4
+numpy
+pyyaml
