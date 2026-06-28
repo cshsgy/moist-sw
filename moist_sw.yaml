@@ -1,0 +1,62 @@
+geometry:
+  type: gnomonic-equiangle      # gnomonic-equiangle cubed sphere
+  bounds:
+    x1min: 6371000.0            # planet radius (m)
+    x1max: 6371001.0
+    x2min_pi: -0.25
+    x2max_pi: 0.25
+    x3min_pi: -0.25
+    x3max_pi: 0.25
+  cells:
+    nx1: 1                      # single layer -> shallow water (the weather layer)
+    nx2: 96
+    nx3: 96
+    nghost: 3
+distribute:
+  backend: gloo                 # CPU collective backend (use nccl for multi-GPU)
+  layout: cubed-sphere
+  nb2: 1
+  nb3: 1
+  blocks_per_process: 6         # all six cube faces on one process
+  verbose: false
+dynamics:
+  equation-of-state:
+    type: shallow-water          # weather-layer geopotential gh' = g' H, momentum gh' v
+  reconstruct:
+    vertical:   {type: weno5, scale: false, shock: false}
+    horizontal: {type: weno5, scale: false, shock: false}
+  riemann-solver:
+    type: shallow-roe
+    dir: yz
+boundary-condition:
+  external:
+    x1-inner: reflecting
+    x1-outer: reflecting
+    x2-inner: custom            # cubed-sphere panel-to-panel exchange
+    x2-outer: custom
+    x3-inner: custom
+    x3-outer: custom
+integration:
+  type: rk3
+  cfl: 0.7
+  nlim: -1
+  tlim: 864000.0               # 10 days (s)
+  ncycle_out: 200
+scalar:
+  nvar: 1                       # the weather-layer water vapour mixing ratio q
+  names: [qv]
+outputs:
+- type: netcdf
+  variables: [prim, scalar_prim]   # height/velocity + mixing ratio q
+  dt: 21600.0                  # write every 6 h
+forcing:
+  coriolis:
+    type: xyz
+    omega1: 7.292e-05          # Earth rotation rate (rad/s)
+problem:
+  note: >
+    Moist shallow water (weather layer + abyssal reservoir) on the cubed sphere.
+    The dry shallow-water dynamics (height H, momentum H v) are integrated by
+    snapy; the moisture physics -- precipitation W1, abyssal feedback W0,
+    evaporation E and the abyssal reservoir alpha0 -- are applied as an
+    operator-split source each step in moist_sw.py (eqs. 101-118 of main.tex).
