@@ -1,0 +1,37 @@
+geometry:
+  type: gnomonic-equiangle
+  bounds:
+    x1min: 71492000.0          # Jupiter equatorial radius (m)
+    x1max: 71492100.0
+    x2min_pi: -0.25
+    x2max_pi: 0.25
+    x3min_pi: -0.25
+    x3max_pi: 0.25
+  cells: {nx1: 1, nx2: 768, nx3: 768, nghost: 3}   # 768/face -> ~100 km min spacing
+distribute:
+  backend: ucx                 # GPU multi-process backend (commux/UCX); 1 face per rank
+  layout: cubed-sphere
+  nb2: 1
+  nb3: 1
+  blocks_per_process: 1        # one cube face per GPU (set 6 for single-process CPU)
+  verbose: false
+dynamics:
+  equation-of-state: {type: shallow-water}
+  reconstruct:
+    vertical:   {type: weno5, scale: false, shock: false}
+    horizontal: {type: weno5, scale: false, shock: false}
+  riemann-solver: {type: shallow-roe, dir: yz}
+boundary-condition:
+  external:
+    x1-inner: reflecting
+    x1-outer: reflecting
+    x2-inner: custom
+    x2-outer: custom
+    x3-inner: custom
+    x3-outer: custom
+integration: {type: rk3, cfl: 0.7, nlim: -1, tlim: 8.64e7, ncycle_out: 2000}
+outputs:
+- {type: netcdf, variables: [prim, scalar_prim], dt: 86400.0}   # prim + vapour q; one frame/day
+forcing:
+  coriolis: {type: xyz, omega1: 1.7585e-4}          # Jupiter rotation rate (rad/s)
+problem: {note: Jupiter shallow water (dry/moist) on the cubed sphere}
