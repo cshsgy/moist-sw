@@ -80,6 +80,52 @@ def turbulence_ic(face, x2v, x3v, rng, target_wind, sigma_cells, H0):
     return gh, vel2, vel3
 
 
+def _uv_to_contra(face, alpha, beta, lon, lat, U, V):
+    """(east U, north V) -> snapy contravariant (vel2, vel3) per cell (W92 method)."""
+    def east_north(v2, v3):
+        gx, gy, gz = csr._local_contra_to_global_xyz(
+            face, np.zeros_like(v2), v2, v3, alpha, beta)
+        east = -np.sin(lon) * gx + np.cos(lon) * gy
+        north = (-np.sin(lat) * np.cos(lon) * gx
+                 - np.sin(lat) * np.sin(lon) * gy + np.cos(lat) * gz)
+        return east, north
+    one = np.ones_like(alpha); zero = np.zeros_like(alpha)
+    e1, n1 = east_north(one, zero)
+    e2, n2 = east_north(zero, one)
+    det = e1 * n2 - e2 * n1
+    return (n2 * U - e2 * V) / det, (-n1 * U + e1 * V) / det
+
+
+def global_forcing(face, alpha, beta, lon, lat, gseed, sigma_deg, nlon=288, nlat=145):
+    """Globally-continuous non-divergent stirring sampled onto one cube face.
+
+    A random streamfunction is built on a lon-lat grid (identical on every rank
+    for a given gseed, so the field is continuous across panel seams), turned
+    into a non-divergent (east,north) wind = k x grad psi, normalised to unit
+    global RMS, sampled at this face's cells and rotated to contravariant.
+    Returns (vel2, vel3) of shape lon.shape.
+    """
+    from scipy.interpolate import RegularGridInterpolator
+    rng = np.random.default_rng(gseed)
+    glon = np.linspace(0.0, 2 * np.pi, nlon, endpoint=False)
+    glat = np.linspace(-np.pi / 2, np.pi / 2, nlat)
+    sig = sigma_deg * nlon / 360.0
+    psi = gaussian_filter(rng.standard_normal((nlat, nlon)), (sig, sig), mode=("nearest", "wrap"))
+    dlat = glat[1] - glat[0]; dlon = glon[1] - glon[0]
+    coslat = np.clip(np.cos(glat), 0.1, None)[:, None]
+    ue = -np.gradient(psi, dlat, axis=0) / A
+    un = np.gradient(psi, dlon, axis=1) / (A * coslat)
+    rms = float(np.sqrt((ue**2 + un**2).mean())) or 1.0
+    ue /= rms; un /= rms
+    # periodic wrap in lon for interpolation
+    glon_e = np.concatenate([glon, [2 * np.pi]])
+    ue_e = np.concatenate([ue, ue[:, :1]], axis=1); un_e = np.concatenate([un, un[:, :1]], axis=1)
+    pts = np.stack([lat.ravel(), (lon % (2 * np.pi)).ravel()], axis=1)
+    U = RegularGridInterpolator((glat, glon_e), ue_e, bounds_error=False, fill_value=None)(pts).reshape(lon.shape)
+    V = RegularGridInterpolator((glat, glon_e), un_e, bounds_error=False, fill_value=None)(pts).reshape(lon.shape)
+    return _uv_to_contra(face, alpha, beta, lon, lat, U, V)
+
+
 _BLUR_K = None
 
 
@@ -235,6 +281,11 @@ def run(args):
         rq = args.q_init + args.q_seed * rng.standard_normal((nc3, nc2))
         r = np.stack([rb, rq])                      # (2, nc3, nc2)
         var0["scalar_r"] = torch.from_numpy(r).reshape(2, nc3, nc2, 1).to(device)
+    elif args.force_amp > 0:
+        # dry forced-dissipative: start from REST; continuous stochastic stirring
+        # + linear drag spin the flow up to a statistically-steady jet state
+        w[0, :, :, 0] = G * args.H0
+        var0 = {"hydro_w": w.to(device)}
     else:
         # dry control: balanced random-streamfunction turbulence at target_wind
         gh, vel2, vel3 = turbulence_ic(face, x2v, x3v, rng,
@@ -244,6 +295,12 @@ def run(args):
         w[3, :, :, 0] = torch.from_numpy(vel3)
         var0 = {"hydro_w": w.to(device)}
     block_vars, current_time = mesh.initialize([var0])
+    forced = (not moist) and args.force_amp > 0
+    F2 = F3 = None
+    refresh = max(1, int(args.force_tau / 200.0))   # regenerate stirring every ~force_tau
+    if forced:                                       # face geometry for global forcing
+        falpha, fbeta = np.meshgrid(x2v, x3v)
+        flon, flat = ab_to_lonlat(FACE_NAMES[face], falpha, fbeta)
 
     # ---- time integration ----
     intg = mesh.module("block0.intg")
@@ -265,6 +322,23 @@ def run(args):
         pbar = cfrac = 0.0
         if moist:
             pbar, cfrac = thermal_source(block_vars[0], coord, args, dt, g3)
+        elif forced:
+            # refresh the global (seam-free) stirring pattern every ~force_tau;
+            # gseed depends only on the refresh index -> identical on all ranks
+            if F2 is None or cycle % refresh == 0:
+                gseed = args.seed * 100003 + (cycle // refresh)
+                f2, f3 = global_forcing(face, falpha, fbeta, flon, flat, gseed, args.force_scale_deg)
+                F2 = torch.from_numpy(f2).reshape(1, nc3, nc2, 1).to(device)
+                F3 = torch.from_numpy(f3).reshape(1, nc3, nc2, 1).to(device)
+            v = block_vars[0]
+            gh = v["hydro_u"][0:1]
+            interior = lambda x: x[:, g3:-g3, g3:-g3, :]
+            # stochastic momentum forcing (accel amp*F on velocity -> gh*amp*F on momentum)
+            interior(v["hydro_u"]).narrow(0, 2, 1).add_(interior(gh * F2) * (args.force_amp * dt))
+            interior(v["hydro_u"]).narrow(0, 3, 1).add_(interior(gh * F3) * (args.force_amp * dt))
+            # linear (Rayleigh) drag on momentum
+            drag = dt / args.drag_tau
+            interior(v["hydro_u"]).narrow(0, 1, 3).mul_(1.0 - drag)
 
         current_time += dt
         mesh.make_outputs(block_vars, current_time)
@@ -291,8 +365,17 @@ if __name__ == "__main__":
     p.add_argument("--target-wind", type=float, default=80.0, dest="target_wind",
                    help="RMS wind speed of the injected turbulence, m/s (default 80)")
     p.add_argument("--eddy-cells", type=float, default=16.0, dest="eddy_cells",
-                   help="streamfunction smoothing sigma in cells (eddy scale; default 16)")
+                   help="stirring/streamfunction smoothing sigma in cells (eddy scale)")
     p.add_argument("--seed", type=int, default=0)
+    # --- dry forced-dissipative turbulence (continuous stirring + drag) ---
+    p.add_argument("--force-amp", type=float, default=0.0, dest="force_amp",
+                   help="stochastic forcing acceleration amplitude, m/s^2 (>0 enables forced dry run from rest)")
+    p.add_argument("--force-tau", type=float, default=2.0e4, dest="force_tau",
+                   help="stirring decorrelation time, s (pattern refreshed each interval)")
+    p.add_argument("--force-scale-deg", type=float, default=12.0, dest="force_scale_deg",
+                   help="forcing length scale in degrees (global streamfunction smoothing)")
+    p.add_argument("--drag-tau", type=float, default=8.64e5, dest="drag_tau",
+                   help="linear (Rayleigh) drag time, s (~10 days; sets equilibrium wind)")
     # --- active 1.5-layer (thermal) moist forcing: convection drives the flow ---
     p.add_argument("--QR", type=float, default=1.0e-7,
                    help="constant top radiative cooling rate of buoyancy, m/s^3")
