@@ -142,6 +142,21 @@ def global_scalar(lon, lat, gseed, sigma_deg, nlon=288, nlat=145):
     return RegularGridInterpolator((glat, glon_e), f_e, bounds_error=False, fill_value=None)(pts).reshape(lon.shape)
 
 
+def harmonic_velocity_np(xyz, U, a, L):
+    """3D non-divergent tangent velocity = curl of a zonal-harmonic streamfunction
+    psi(x)=sum_j a_j P_L(x.u_j):  v(x) = sum_j a_j P_L'(x.u_j) (x cross u_j)
+                                       = x cross ( sum_j a_j P_L'(x.u_j) u_j ).
+    Isotropic over the sphere (regular at the poles, no lon-lat grid) -> uniform
+    and seam-free by construction. (numpy; used only for the small normalisation
+    sample -- the full face evaluation is done on the GPU.)"""
+    t = np.clip(xyz @ U.T, -1.0, 1.0)
+    p0 = np.ones_like(t); p1 = np.array(t, dtype=float)
+    for nn in range(2, L + 1):
+        p0, p1 = p1, ((2 * nn - 1) * t * p1 - (nn - 1) * p0) / nn   # P_{L-1}=p0, P_L=p1
+    dP = L * (p0 - t * p1) / np.clip(1 - t * t, 1e-6, None)
+    return np.cross(xyz, (a * dP) @ U)
+
+
 _BLUR_K = None
 
 
@@ -316,11 +331,55 @@ def run(args):
         var0 = {"hydro_w": w.to(device)}
     block_vars, current_time = mesh.initialize([var0])
     forced = (not moist) and args.force_amp > 0
-    F2 = F3 = None
     refresh = max(1, int(args.force_tau / 200.0))   # regenerate stirring every ~force_tau
-    if forced:                                       # face geometry for global forcing
+    if forced:
         falpha, fbeta = np.meshgrid(x2v, x3v)
         flon, flat = ab_to_lonlat(FACE_NAMES[face], falpha, fbeta)
+        L = int(args.force_degree)
+        xyz_dev = torch.from_numpy(np.stack(
+            [np.cos(flat) * np.cos(flon), np.cos(flat) * np.sin(flon), np.sin(flat)],
+            axis=-1).reshape(-1, 3)).to(device)
+
+        def _make_F(k):
+            # draw the random zonal-harmonic modes (identical on every rank)
+            rng = np.random.default_rng(args.seed * 100003 + k)
+            Un = rng.standard_normal((args.force_modes, 3))
+            Un /= np.linalg.norm(Un, axis=1, keepdims=True)
+            an = rng.standard_normal(args.force_modes)
+            rs = np.random.default_rng(args.seed * 100003 + k + 7).standard_normal((2000, 3))
+            rs /= np.linalg.norm(rs, axis=1, keepdims=True)
+            nrm = float(np.sqrt((harmonic_velocity_np(rs, Un, an, L) ** 2).sum(-1).mean())) or 1.0
+            Ut = torch.from_numpy(Un).to(device); at = torch.from_numpy(an / nrm).to(device)
+            # GPU evaluation of the forcing velocity at this face's cells
+            t = xyz_dev @ Ut.T
+            p0 = torch.ones_like(t); p1 = t
+            for nn in range(2, L + 1):
+                p0, p1 = p1, ((2 * nn - 1) * t * p1 - (nn - 1) * p0) / nn
+            dP = L * (p0 - t * p1) / torch.clamp(1 - t * t, min=1e-6)
+            v = torch.cross(xyz_dev, (at * dP) @ Ut, dim=-1).cpu().numpy().reshape(nc3, nc2, 3)
+            e = -np.sin(flon) * v[..., 0] + np.cos(flon) * v[..., 1]
+            n = (-np.sin(flat) * np.cos(flon) * v[..., 0]
+                 - np.sin(flat) * np.sin(flon) * v[..., 1] + np.cos(flat) * v[..., 2])
+            f2, f3 = _uv_to_contra(face, falpha, fbeta, flon, flat, e, n)
+            return (torch.from_numpy(f2).reshape(1, nc3, nc2, 1).to(device),
+                    torch.from_numpy(f3).reshape(1, nc3, nc2, 1).to(device))
+
+        F_holder = [_make_F(0)]
+
+        def forcing_func(vars, dt, stage):
+            # forcing fed in as a TENDENCY, integrated inside snapy's timestep and
+            # exchanged with the dynamics (seam-free): non-divergent stochastic
+            # stirring of the momentum (gh * accel) + linear (Rayleigh) drag
+            # hydro_du is the dt-scaled flux increment, so multiply by dt here
+            du = torch.zeros_like(vars["hydro_u"])
+            gh = vars["hydro_u"][0:1]
+            F2, F3 = F_holder[0]
+            du.narrow(0, 2, 1).copy_(gh * F2 * (args.force_amp * dt))
+            du.narrow(0, 3, 1).copy_(gh * F3 * (args.force_amp * dt))
+            du.narrow(0, 1, 3).add_(vars["hydro_u"].narrow(0, 1, 3) * (-dt / args.drag_tau))
+            return {"hydro_du": du}
+
+        block.set_user_forcing_func(forcing_func)
 
     # ---- time integration ----
     intg = mesh.module("block0.intg")
@@ -342,23 +401,10 @@ def run(args):
         pbar = cfrac = 0.0
         if moist:
             pbar, cfrac = thermal_source(block_vars[0], coord, args, dt, g3)
-        elif forced:
-            # refresh the global (seam-free) random HEIGHT pattern every ~force_tau;
-            # gseed depends only on the refresh index -> identical on all ranks
-            if F2 is None or cycle % refresh == 0:
-                gseed = args.seed * 100003 + (cycle // refresh)
-                fp = global_scalar(flon, flat, gseed, args.force_scale_deg)
-                F2 = torch.from_numpy(fp).reshape(1, nc3, nc2, 1).to(device)
-            v = block_vars[0]
-            interior = lambda x: x[:, g3:-g3, g3:-g3, :]
-            drag = dt / args.drag_tau
-            # scalar height forcing (seam-free) -> geostrophic adjustment -> jets;
-            # plus Rayleigh drag on momentum
-            kick = args.force_amp * dt
-            interior(v["hydro_u"]).narrow(0, 0, 1).add_(interior(F2) * kick)
-            interior(v["hydro_w"]).narrow(0, 0, 1).add_(interior(F2) * kick)
-            interior(v["hydro_u"]).narrow(0, 1, 3).mul_(1.0 - drag)
-            interior(v["hydro_w"]).narrow(0, 1, 3).mul_(1.0 - drag)
+        elif forced and cycle % refresh == 0:
+            # refresh the stirring pattern (applied via the forcing callback,
+            # inside snapy's integrated+exchanged timestep -> no panel seams)
+            F_holder[0] = _make_F(cycle // refresh)
 
         current_time += dt
         mesh.make_outputs(block_vars, current_time)
@@ -393,11 +439,17 @@ if __name__ == "__main__":
     p.add_argument("--force-tau", type=float, default=2.0e4, dest="force_tau",
                    help="stirring decorrelation time, s (pattern refreshed each interval)")
     p.add_argument("--force-scale-deg", type=float, default=12.0, dest="force_scale_deg",
-                   help="forcing length scale in degrees (global streamfunction smoothing)")
+                   help="(legacy) lon-lat forcing length scale in degrees")
+    p.add_argument("--force-degree", type=int, default=42, dest="force_degree",
+                   help="zonal-harmonic degree of the stirring (higher = smaller scale)")
+    p.add_argument("--force-modes", type=int, default=256, dest="force_modes",
+                   help="number of random zonal-harmonic modes")
     p.add_argument("--drag-tau", type=float, default=8.64e5, dest="drag_tau",
                    help="linear (Rayleigh) drag time, s (~10 days; sets equilibrium wind)")
     p.add_argument("--visc", type=float, default=0.0,
                    help="isotropic Laplacian viscosity, m^2/s (damps grid/seam noise)")
+    p.add_argument("--smooth", type=float, default=0.0,
+                   help="per-step cross-panel velocity smoothing fraction (0.02-0.1; damps seams)")
     # --- active 1.5-layer (thermal) moist forcing: convection drives the flow ---
     p.add_argument("--QR", type=float, default=1.0e-7,
                    help="constant top radiative cooling rate of buoyancy, m/s^3")
