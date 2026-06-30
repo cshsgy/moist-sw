@@ -14,3 +14,8 @@ out_*/
 # python
 __pycache__/
 *.pyc
+
+# latex build artifacts
+*.aux
+*.log
+*.out
