@@ -114,7 +114,11 @@ def convective_source(v, p, dt, g3):
     q = interior(v["scalar_r"])[0]
 
     gh = gh - (gh - p.gh_rad) / p.tau_rad * dt              # radiative cooling
-    P1 = torch.clamp(H * (q - p.qs) / p.tau_c, min=0.0)     # precipitation (m/s)
+    # Betts-Miller-style trigger: once q>qs, convection fires and consumes
+    # moisture down toward q_ref (< qs) -> the cell overshoots to sub-saturation
+    # and switches off, giving intermittent / localized (not uniform) convection
+    trig = (q > p.qs).double()
+    P1 = torch.clamp(H * (q - p.q_ref) / p.tau_c, min=0.0) * trig   # precipitation (m/s)
     dgh_lat = torch.clamp(G * p.beta1 * P1 * dt, max=p.maxdrop * gh)  # latent-heat mass sink
     gh_new = torch.clamp(gh - dgh_lat, min=G * p.hfloor)
 
@@ -133,6 +137,66 @@ def convective_source(v, p, dt, g3):
     return float(P1.mean()), float((q > p.qs).double().mean())
 
 
+def thermal_source(v, coord, p, dt, g3):
+    """Active 1.5-layer (thermal/Ripa) moist physics with constant-flux top
+    cooling (main.tex section 4), operator-split after the snapy advection step.
+
+    snapy carries the bulk reduced-gravity SWE with reference buoyancy b0 (the
+    prognostic gh = b0 H), plus two advected scalars r0=b (buoyancy) and r1=q.
+    Each step we add, in place:
+      * the thermal-wind force  -grad( 1/2 (b-b0) gh^2 / b0 )  on the momentum
+        (this is the buoyancy-anomaly part of the Ripa pressure  -grad(1/2 b H^2));
+      * radiative cooling  db = -Q_R dt   and latent heating  db = +Lambda P/H dt;
+      * evaporation E and precipitation P (with qs depending on b);
+      * the condensation mass sink  dgh = -b0 beta P dt.
+    Returns (mean precip, convecting fraction).
+    """
+    b0 = p.b0
+    interior = lambda x: x[:, g3:-g3, g3:-g3, :]
+
+    # ---- thermal-wind force from the advected buoyancy (full array) ----
+    gh = v["hydro_u"][0]                       # (nc3f, nc2f, 1)
+    b = v["scalar_r"][0]
+    Pi = 0.5 * (b - b0) * gh * gh / b0          # buoyancy-anomaly pressure
+    w2 = coord.center_width2(); w3 = coord.center_width3()   # PHYSICAL cell widths (m)
+    g2 = torch.zeros_like(Pi); g3f = torch.zeros_like(Pi)
+    g2[:, 1:-1, :] = (Pi[:, 2:, :] - Pi[:, :-2, :]) / (2 * w2[:, 1:-1, :])   # d/dx2 (physical)
+    g3f[1:-1, :, :] = (Pi[2:, :, :] - Pi[:-2, :, :]) / (2 * w3[1:-1, :, :])  # d/dx3 (physical)
+    interior(v["hydro_u"]).narrow(0, 2, 1)[0] -= interior(g2[None])[0] * dt  # vel2 momentum
+    interior(v["hydro_u"]).narrow(0, 3, 1)[0] -= interior(g3f[None])[0] * dt  # vel3 momentum
+
+    # ---- thermodynamics (interior) ----
+    ghi = interior(v["hydro_u"])[0]
+    H = ghi / b0
+    bi = interior(v["scalar_r"])[0]
+    q = interior(v["scalar_r"])[1]
+    qs = p.qs0 * (1.0 + p.cqs * (bi - b0) / b0)          # Clausius-Clapeyron (linearised)
+    # Betts-Miller trigger: where q>qs, convection consumes moisture toward
+    # q_ref < qs so the cell overshoots sub-saturated and shuts off -> patchy
+    # convection -> buoyancy gradients -> thermal-wind driving
+    P1 = torch.clamp(H * (q - p.q_ref) / p.tau_c, min=0.0) * (q > qs).double()
+    E = torch.clamp(H * (p.q_surf - q) / p.tau_e, min=0.0)
+
+    b_new = bi + (-p.QR + p.Lambda * P1 / torch.clamp(H, min=p.hfloor)) * dt   # cooling + latent
+    Hq_new = torch.clamp(H * q + (E - P1) * dt, min=0.0)
+    gh_new = torch.clamp(ghi - b0 * p.beta * P1 * dt, min=b0 * p.hfloor)       # mass sink
+    Hn = gh_new / b0
+    q_new = torch.clamp(Hq_new / torch.clamp(Hn, min=p.hfloor), 0.0, p.qcap)
+
+    interior(v["hydro_u"])[0] = gh_new
+    interior(v["hydro_w"])[0] = gh_new
+    interior(v["scalar_r"])[0] = b_new
+    interior(v["scalar_r"])[1] = q_new
+    interior(v["scalar_s"])[0] = gh_new * b_new
+    interior(v["scalar_s"])[1] = gh_new * q_new
+    # light diffusion of both scalars (stability of the advected fields)
+    if p.scalar_diff > 0:
+        for k in range(2):
+            v["scalar_s"][k:k+1] = ((1 - p.scalar_diff) * v["scalar_s"][k:k+1]
+                                    + p.scalar_diff * _blur(v["scalar_s"][k:k+1]))
+    return float(P1.mean()), float((q > qs).double().mean())
+
+
 def run(args):
     device = paddle.start_dist("ucx")          # sets cuda device + process group
     rank = dist.get_rank() if dist.is_initialized() else 0
@@ -147,7 +211,7 @@ def run(args):
     opt.block().output_dir(args.out)
     opt.block().intg().tlim(args.days * 86400.0)
     if moist:
-        sc = opt.block().scalar(); sc.nvar(1); sc.names(["qv"]); opt.block().scalar(sc)
+        sc = opt.block().scalar(); sc.nvar(2); sc.names(["buoy", "qv"]); opt.block().scalar(sc)
     if rank == 0:
         os.makedirs(args.out, exist_ok=True)
     dist.barrier()
@@ -162,13 +226,15 @@ def run(args):
     rng = np.random.default_rng(args.seed + 1000 * rank)   # independent field per face
     w = torch.zeros((4, nc3, nc2, 1), dtype=torch.float64)
     if moist:
-        # convective driving: start from REST + tiny moisture seed; convection
-        # spins the flow up spontaneously (no injected kinetic energy)
-        w[0, :, :, 0] = G * args.H0
+        # active 1.5-layer: REST, neutral buoyancy b=b0, sub-saturated q + seed;
+        # constant-flux top cooling spins convection (hence the flow) up from rest
+        args.b0 = G
+        w[0, :, :, 0] = args.b0 * args.H0          # gh = b0 H
         var0 = {"hydro_w": w.to(device)}
-        r = args.qs + args.q_seed * rng.standard_normal((nc3, nc2))
-        var0["scalar_r"] = torch.from_numpy(r).reshape(1, nc3, nc2, 1).to(device)
-        args.gh_rad = args.gh_rad_frac * G * args.H0
+        rb = np.full((nc3, nc2), args.b0)
+        rq = args.q_init + args.q_seed * rng.standard_normal((nc3, nc2))
+        r = np.stack([rb, rq])                      # (2, nc3, nc2)
+        var0["scalar_r"] = torch.from_numpy(r).reshape(2, nc3, nc2, 1).to(device)
     else:
         # dry control: balanced random-streamfunction turbulence at target_wind
         gh, vel2, vel3 = turbulence_ic(face, x2v, x3v, rng,
@@ -198,7 +264,7 @@ def run(args):
 
         pbar = cfrac = 0.0
         if moist:
-            pbar, cfrac = convective_source(block_vars[0], args, dt, g3)
+            pbar, cfrac = thermal_source(block_vars[0], coord, args, dt, g3)
 
         current_time += dt
         mesh.make_outputs(block_vars, current_time)
@@ -227,26 +293,31 @@ if __name__ == "__main__":
     p.add_argument("--eddy-cells", type=float, default=16.0, dest="eddy_cells",
                    help="streamfunction smoothing sigma in cells (eddy scale; default 16)")
     p.add_argument("--seed", type=int, default=0)
-    # --- moist radiative-convective forcing (convection drives the flow) ---
-    p.add_argument("--qs", type=float, default=0.02, help="saturation mixing ratio (precip threshold)")
-    p.add_argument("--q-surf", type=float, default=0.030, dest="q_surf",
-                   help="surface saturation that evaporation moistens toward (>qs)")
+    # --- active 1.5-layer (thermal) moist forcing: convection drives the flow ---
+    p.add_argument("--QR", type=float, default=1.0e-7,
+                   help="constant top radiative cooling rate of buoyancy, m/s^3")
+    p.add_argument("--Lambda", type=float, default=8.0,
+                   help="latent-buoyancy factor Lg/(Cp theta0), m/s^2")
+    p.add_argument("--beta", type=float, default=1.0, help="condensation mass-sink factor")
+    p.add_argument("--qs0", type=float, default=0.02, help="reference saturation mixing ratio at b0")
+    p.add_argument("--cqs", type=float, default=3.0,
+                   help="Clausius-Clapeyron sensitivity: qs = qs0(1 + cqs (b-b0)/b0)")
+    p.add_argument("--q-surf", type=float, default=0.03, dest="q_surf",
+                   help="surface value evaporation moistens q toward")
+    p.add_argument("--q-init", type=float, default=0.018, dest="q_init",
+                   help="initial (sub-saturated) mixing ratio")
+    p.add_argument("--q-ref", type=float, default=0.016, dest="q_ref",
+                   help="Betts-Miller: convection depletes q toward this (<qs0)")
     p.add_argument("--q-seed", type=float, default=1.0e-3, dest="q_seed",
                    help="amplitude of the initial random q perturbation")
-    p.add_argument("--beta1", type=float, default=8.0, help="latent-heating mass-sink factor")
-    p.add_argument("--tau-rad", type=float, default=1.7e6, dest="tau_rad",
-                   help="radiative relaxation time, s (~20 days)")
-    p.add_argument("--gh-rad-frac", type=float, default=1.0, dest="gh_rad_frac",
-                   help="radiative-equilibrium geopotential as a fraction of g*H0")
-    p.add_argument("--tau-evap", type=float, default=3.0e5, dest="tau_evap",
-                   help="evaporation (surface-moistening) time, s (~3.5 days)")
+    p.add_argument("--tau-e", type=float, default=3.0e5, dest="tau_e",
+                   help="evaporation time, s (~3.5 days)")
     p.add_argument("--tau-c", type=float, default=2.0e4, dest="tau_c",
-                   help="convective/precip relaxation time, s (~0.2 day)")
-    p.add_argument("--scalar-diff", type=float, default=0.12, dest="scalar_diff",
-                   help="per-step vapour diffusion fraction (suppresses advective overshoot)")
+                   help="convective/precip time, s (~0.2 day)")
+    p.add_argument("--scalar-diff", type=float, default=0.04, dest="scalar_diff",
+                   help="per-step scalar diffusion fraction (stability of b, q)")
     p.add_argument("--cfl", type=float, default=0.5, help="CFL for the moist run")
     p.add_argument("--hfloor", type=float, default=100.0)
-    p.add_argument("--qcap", type=float, default=0.08)
-    p.add_argument("--maxdrop", type=float, default=0.2)
+    p.add_argument("--qcap", type=float, default=0.10)
     p.add_argument("--diag-every", type=int, default=2000)
     run(p.parse_args())
