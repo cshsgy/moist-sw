@@ -126,6 +126,22 @@ def global_forcing(face, alpha, beta, lon, lat, gseed, sigma_deg, nlon=288, nlat
     return _uv_to_contra(face, alpha, beta, lon, lat, U, V)
 
 
+def global_scalar(lon, lat, gseed, sigma_deg, nlon=288, nlat=145):
+    """Globally-continuous zero-mean unit-std random scalar field sampled onto a
+    cube face (for seam-free HEIGHT forcing -- scalars exchange across panels
+    with no basis rotation, unlike contravariant velocity components)."""
+    from scipy.interpolate import RegularGridInterpolator
+    rng = np.random.default_rng(gseed)
+    glon = np.linspace(0.0, 2 * np.pi, nlon, endpoint=False)
+    glat = np.linspace(-np.pi / 2, np.pi / 2, nlat)
+    sig = sigma_deg * nlon / 360.0
+    f = gaussian_filter(rng.standard_normal((nlat, nlon)), (sig, sig), mode=("nearest", "wrap"))
+    f -= f.mean(); f /= (f.std() or 1.0)
+    glon_e = np.concatenate([glon, [2 * np.pi]]); f_e = np.concatenate([f, f[:, :1]], axis=1)
+    pts = np.stack([lat.ravel(), (lon % (2 * np.pi)).ravel()], axis=1)
+    return RegularGridInterpolator((glat, glon_e), f_e, bounds_error=False, fill_value=None)(pts).reshape(lon.shape)
+
+
 _BLUR_K = None
 
 
@@ -252,6 +268,10 @@ def run(args):
     opt = MeshOptions.from_yaml(args.config)
     opt.set_local_horizontal_cells(args.N, args.N)
     opt.blocks_per_process(1)
+    if args.visc > 0:                              # metric-correct Laplacian viscosity
+        from snapy import DiffusionOptions
+        do = DiffusionOptions(); do.nu_iso(args.visc)
+        opt.block().hydro().diffusion(do)
     if moist:
         opt.block().intg().cfl(args.cfl)        # lower CFL for stiff moist source
     opt.block().output_dir(args.out)
@@ -323,22 +343,22 @@ def run(args):
         if moist:
             pbar, cfrac = thermal_source(block_vars[0], coord, args, dt, g3)
         elif forced:
-            # refresh the global (seam-free) stirring pattern every ~force_tau;
+            # refresh the global (seam-free) random HEIGHT pattern every ~force_tau;
             # gseed depends only on the refresh index -> identical on all ranks
             if F2 is None or cycle % refresh == 0:
                 gseed = args.seed * 100003 + (cycle // refresh)
-                f2, f3 = global_forcing(face, falpha, fbeta, flon, flat, gseed, args.force_scale_deg)
-                F2 = torch.from_numpy(f2).reshape(1, nc3, nc2, 1).to(device)
-                F3 = torch.from_numpy(f3).reshape(1, nc3, nc2, 1).to(device)
+                fp = global_scalar(flon, flat, gseed, args.force_scale_deg)
+                F2 = torch.from_numpy(fp).reshape(1, nc3, nc2, 1).to(device)
             v = block_vars[0]
-            gh = v["hydro_u"][0:1]
             interior = lambda x: x[:, g3:-g3, g3:-g3, :]
-            # stochastic momentum forcing (accel amp*F on velocity -> gh*amp*F on momentum)
-            interior(v["hydro_u"]).narrow(0, 2, 1).add_(interior(gh * F2) * (args.force_amp * dt))
-            interior(v["hydro_u"]).narrow(0, 3, 1).add_(interior(gh * F3) * (args.force_amp * dt))
-            # linear (Rayleigh) drag on momentum
             drag = dt / args.drag_tau
+            # scalar height forcing (seam-free) -> geostrophic adjustment -> jets;
+            # plus Rayleigh drag on momentum
+            kick = args.force_amp * dt
+            interior(v["hydro_u"]).narrow(0, 0, 1).add_(interior(F2) * kick)
+            interior(v["hydro_w"]).narrow(0, 0, 1).add_(interior(F2) * kick)
             interior(v["hydro_u"]).narrow(0, 1, 3).mul_(1.0 - drag)
+            interior(v["hydro_w"]).narrow(0, 1, 3).mul_(1.0 - drag)
 
         current_time += dt
         mesh.make_outputs(block_vars, current_time)
@@ -369,13 +389,15 @@ if __name__ == "__main__":
     p.add_argument("--seed", type=int, default=0)
     # --- dry forced-dissipative turbulence (continuous stirring + drag) ---
     p.add_argument("--force-amp", type=float, default=0.0, dest="force_amp",
-                   help="stochastic forcing acceleration amplitude, m/s^2 (>0 enables forced dry run from rest)")
+                   help="height (geopotential) forcing rate, m^2/s^3 (>0 enables forced dry run from rest; seam-free)")
     p.add_argument("--force-tau", type=float, default=2.0e4, dest="force_tau",
                    help="stirring decorrelation time, s (pattern refreshed each interval)")
     p.add_argument("--force-scale-deg", type=float, default=12.0, dest="force_scale_deg",
                    help="forcing length scale in degrees (global streamfunction smoothing)")
     p.add_argument("--drag-tau", type=float, default=8.64e5, dest="drag_tau",
                    help="linear (Rayleigh) drag time, s (~10 days; sets equilibrium wind)")
+    p.add_argument("--visc", type=float, default=0.0,
+                   help="isotropic Laplacian viscosity, m^2/s (damps grid/seam noise)")
     # --- active 1.5-layer (thermal) moist forcing: convection drives the flow ---
     p.add_argument("--QR", type=float, default=1.0e-7,
                    help="constant top radiative cooling rate of buoyancy, m/s^3")
